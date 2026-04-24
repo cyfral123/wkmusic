@@ -1,0 +1,7 @@
+﻿{
+  "name": "WKMusic",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/cyfral123/wkmusic",
+  "description": "Displays your current Spotify track on the in-game HUD",
+  "dependencies": ["BepInEx-BepInExPack-5.4.2305"]
+}
