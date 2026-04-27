@@ -20,6 +20,7 @@ public class Plugin : BaseUnityPlugin
     internal volatile PlaybackState State = PlaybackState.Empty;
     internal volatile bool Initialized;
     internal volatile bool Initializing;
+    internal DateTime StateUpdatedAtUtc = DateTime.UtcNow;
 
     internal volatile byte[]? PendingCoverBytes;
 
@@ -56,6 +57,8 @@ public class Plugin : BaseUnityPlugin
             {
                 string clientId, clientSecret;
 
+                var tokenStorage = new TokenStorage();
+
                 if (saved is null)
                 {
                     Logger.LogInfo("WKMusic: credentials missing, opening browser setup...");
@@ -75,7 +78,7 @@ public class Plugin : BaseUnityPlugin
                     }
 
                     credStorage.Save(setup.ClientId, setup.ClientSecret);
-                    new TokenStorage().Save(setup.Token);
+                    tokenStorage.Save(setup.Token);
 
                     clientId = setup.ClientId;
                     clientSecret = setup.ClientSecret;
@@ -88,10 +91,46 @@ public class Plugin : BaseUnityPlugin
 
                 var client = new SpotifyClient(
                     new SpotifyAuth(workerUrl, clientSecret),
-                    new TokenStorage(),
+                    tokenStorage,
                     clientId);
 
-                await client.InitializeAsync();
+                try
+                {
+                    await client.InitializeAsync();
+                }
+                catch (SpotifyAuthException ex) when (saved is not null && ex.Error == "invalid_client")
+                {
+                    Logger.LogWarning("WKMusic: saved Spotify credentials were rejected; clearing them and reopening setup.");
+                    tokenStorage.Clear();
+                    credStorage.Clear();
+
+                    var setup = await BrowserSetup.RunAsync(
+                        workerUrl,
+                        (id, secret, code) =>
+                        {
+                            var auth = new SpotifyAuth(workerUrl, secret);
+                            var redirectUri = $"{workerUrl}/callback";
+                            return auth.ExchangeCodeAsync(id, code, redirectUri, default);
+                        },
+                        initialClientId: clientId);
+
+                    if (setup is null)
+                    {
+                        Logger.LogWarning("WKMusic: setup cancelled.");
+                        return;
+                    }
+
+                    credStorage.Save(setup.ClientId, setup.ClientSecret);
+                    tokenStorage.Save(setup.Token);
+
+                    client = new SpotifyClient(
+                        new SpotifyAuth(workerUrl, setup.ClientSecret),
+                        tokenStorage,
+                        setup.ClientId);
+
+                    await client.InitializeAsync();
+                }
+
                 Initialized = true;
                 Logger.LogInfo("WKMusic: Spotify connected.");
                 StartPolling(client);
@@ -113,16 +152,24 @@ public class Plugin : BaseUnityPlugin
 
     private void StartPolling(IMusicClient client)
     {
+        const int NormalPollDelayMs = 1000;
+        const int ErrorPollDelayMs = 5000;
+        const int MaxShortRateLimitDelayMs = 30000;
+
         var http = new HttpClient();
         string? lastCoverToken = null;
 
         Task.Run(async () =>
         {
+            var delayMs = NormalPollDelayMs;
+
             while (true)
             {
                 try
                 {
                     State = await client.GetPlaybackStateAsync();
+                    StateUpdatedAtUtc = DateTime.UtcNow;
+                    delayMs = NormalPollDelayMs;
 
                     var track = State.Track;
                     var coverToken = track is null
@@ -141,18 +188,47 @@ public class Plugin : BaseUnityPlugin
                                 : Array.Empty<byte>();
                     }
                 }
+                catch (SpotifyRateLimitException ex)
+                {
+                    var requestedDelayMs = Math.Max(NormalPollDelayMs, (int)Math.Ceiling(ex.RetryAfter.TotalMilliseconds));
+                    delayMs = requestedDelayMs <= MaxShortRateLimitDelayMs
+                        ? requestedDelayMs
+                        : requestedDelayMs;
+
+                    var status = requestedDelayMs > MaxShortRateLimitDelayMs
+                        ? $"Spotify rate limited ({FormatDelay(delayMs)})"
+                        : "Spotify rate limited";
+
+                    State = State with { StatusMessage = status };
+                    StateUpdatedAtUtc = DateTime.UtcNow;
+
+                    Logger.LogWarning(
+                        $"WKMusic: Spotify rate limited polling; retrying in {delayMs} ms. " +
+                        $"Retry-After={ex.RawRetryAfter ?? "missing"}, requested={requestedDelayMs} ms.");
+                }
                 catch (Exception ex)
                 {
+                    delayMs = ErrorPollDelayMs;
                     Logger.LogWarning($"WKMusic: poll error - {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
                 }
 
-                await Task.Delay(300);
+                await Task.Delay(delayMs);
             }
         });
     }
 
     internal static string Truncate(string s, int max) =>
         s.Length <= max ? s : s[..(max - 3)] + "...";
+
+    private static string FormatDelay(int delayMs)
+    {
+        var delay = TimeSpan.FromMilliseconds(delayMs);
+        if (delay.TotalHours >= 1)
+            return $"{(int)delay.TotalHours}h {delay.Minutes}m";
+        if (delay.TotalMinutes >= 1)
+            return $"{(int)delay.TotalMinutes}m {delay.Seconds}s";
+        return $"{delay.Seconds}s";
+    }
 }
 
 [HarmonyPatch(typeof(CL_UIManager), "Awake")]
@@ -424,6 +500,13 @@ internal static class Patch_UIManager_Update
 
         var state = p.State;
 
+        if (!string.IsNullOrEmpty(state.StatusMessage))
+        {
+            SetTrackLabel(state.StatusMessage);
+            ProgressLabel.text = "";
+            return;
+        }
+
         if (HudGroup != null)
         {
             var paused = state.Track != null && !state.IsPlaying;
@@ -443,9 +526,14 @@ internal static class Patch_UIManager_Update
         }
 
         var track = state.Track;
-        var progress = TimeSpan.FromMilliseconds(state.ProgressMs);
+        var progressMs = state.IsPlaying
+            ? state.ProgressMs + (int)(DateTime.UtcNow - p.StateUpdatedAtUtc).TotalMilliseconds
+            : state.ProgressMs;
+        progressMs = Math.Clamp(progressMs, 0, track.DurationMs);
+
+        var progress = TimeSpan.FromMilliseconds(progressMs);
         var duration = TimeSpan.FromMilliseconds(track.DurationMs);
-        var ratio = track.DurationMs > 0 ? (double)state.ProgressMs / track.DurationMs : 0;
+        var ratio = track.DurationMs > 0 ? (double)progressMs / track.DurationMs : 0;
 
         const int barWidth = 50;
         var pos = Math.Clamp((int)Math.Round(ratio * barWidth), 0, barWidth);

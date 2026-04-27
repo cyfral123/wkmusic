@@ -25,7 +25,8 @@ public record TrackInfo(
 public record PlaybackState(
     TrackInfo? Track,
     bool IsPlaying,
-    int ProgressMs
+    int ProgressMs,
+    string? StatusMessage = null
 )
 {
     public static PlaybackState Empty => new(null, false, 0);

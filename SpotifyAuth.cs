@@ -7,6 +7,13 @@ using Newtonsoft.Json.Linq;
 
 namespace WKMusic;
 
+public class SpotifyAuthException(string message, string? error, string responseBody)
+    : Exception(message)
+{
+    public string? Error { get; } = error;
+    public string ResponseBody { get; } = responseBody;
+}
+
 public class SpotifyAuth(string workerUrl, string clientSecret, HttpClient? http = null)
 {
     private const string TokenUrl = "https://accounts.spotify.com/api/token";
@@ -44,7 +51,10 @@ public class SpotifyAuth(string workerUrl, string clientSecret, HttpClient? http
         var json = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
-            throw new Exception($"Token refresh failed: {json}");
+        {
+            var error = TryReadSpotifyError(json);
+            throw new SpotifyAuthException($"Token refresh failed: {json}", error, json);
+        }
 
         var obj = JObject.Parse(json);
         return new SpotifyToken(
@@ -71,7 +81,10 @@ public class SpotifyAuth(string workerUrl, string clientSecret, HttpClient? http
         var json = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
-            throw new Exception($"Token exchange failed: {json}");
+        {
+            var error = TryReadSpotifyError(json);
+            throw new SpotifyAuthException($"Token exchange failed: {json}", error, json);
+        }
 
         var obj = JObject.Parse(json);
         return new SpotifyToken(
@@ -80,5 +93,17 @@ public class SpotifyAuth(string workerUrl, string clientSecret, HttpClient? http
             ExpiresIn: obj["expires_in"]!.Value<int>(),
             ObtainedAt: DateTime.UtcNow
         );
+    }
+
+    private static string? TryReadSpotifyError(string json)
+    {
+        try
+        {
+            return JObject.Parse(json)["error"]?.Value<string>();
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

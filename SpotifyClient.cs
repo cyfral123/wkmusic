@@ -10,6 +10,13 @@ using Newtonsoft.Json.Linq;
 
 namespace WKMusic;
 
+public class SpotifyRateLimitException(TimeSpan retryAfter, string? rawRetryAfter)
+    : Exception($"Spotify rate limit reached. Retry after {retryAfter.TotalSeconds:0.#}s.")
+{
+    public TimeSpan RetryAfter { get; } = retryAfter;
+    public string? RawRetryAfter { get; } = rawRetryAfter;
+}
+
 public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string clientId, HttpClient? http = null)
     : IMusicClient
 {
@@ -31,8 +38,7 @@ public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string client
         }
         else if (_token.IsExpired)
         {
-            _token = await auth.RefreshAsync(_clientId, _token, ct);
-            storage.Save(_token);
+            await ForceRefreshAsync(ct);
         }
     }
 
@@ -80,6 +86,7 @@ public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string client
             return await GetAsync(path, ct);
         }
 
+        EnsureNotRateLimited(response);
         response.EnsureSuccessStatusCode();
         return await response.Content.ReadAsStringAsync();
     }
@@ -102,7 +109,10 @@ public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string client
         }
 
         if (response.StatusCode != HttpStatusCode.NoContent)
+        {
+            EnsureNotRateLimited(response);
             response.EnsureSuccessStatusCode();
+        }
     }
 
     private async Task PostAsync(string path, CancellationToken ct)
@@ -123,7 +133,10 @@ public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string client
         }
 
         if (response.StatusCode != HttpStatusCode.NoContent)
+        {
+            EnsureNotRateLimited(response);
             response.EnsureSuccessStatusCode();
+        }
     }
 
     private async Task EnsureTokenValidAsync(CancellationToken ct)
@@ -137,8 +150,33 @@ public class SpotifyClient(SpotifyAuth auth, TokenStorage storage, string client
 
     private async Task ForceRefreshAsync(CancellationToken ct)
     {
-        _token = await auth.RefreshAsync(_clientId, _token!, ct);
+        try
+        {
+            _token = await auth.RefreshAsync(_clientId, _token!, ct);
+        }
+        catch (SpotifyAuthException ex) when (ex.Error == "invalid_grant")
+        {
+            storage.Clear();
+            _token = await auth.AuthorizeAsync(_clientId, ct);
+        }
+
         storage.Save(_token);
+    }
+
+    private static void EnsureNotRateLimited(HttpResponseMessage response)
+    {
+        if ((int)response.StatusCode != 429) return;
+
+        response.Headers.TryGetValues("Retry-After", out var retryAfterValues);
+        var rawRetryAfter = retryAfterValues?.FirstOrDefault();
+        var retryAfter = response.Headers.RetryAfter?.Delta
+                         ?? (response.Headers.RetryAfter?.Date - DateTimeOffset.UtcNow)
+                         ?? TimeSpan.FromSeconds(10);
+
+        if (retryAfter < TimeSpan.FromSeconds(1))
+            retryAfter = TimeSpan.FromSeconds(1);
+
+        throw new SpotifyRateLimitException(retryAfter, rawRetryAfter);
     }
     
     private static TrackInfo ParseTrack(JToken item)
